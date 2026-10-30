@@ -2,6 +2,12 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, ".env") });
+dotenv.config();
 import { getCompanyFundamentals, getResearchPack } from "./companyDirectory.js";
 import db from "./db.js";
 import { hashPassword, verifyPassword, signToken, requireAuth, optionalAuth } from "./auth.js";
@@ -16,7 +22,6 @@ import {
   seedVerifiedAnnouncements
 } from "./pushEngine.js";
 
-dotenv.config();
 const app = express();
 app.use(helmet());
 
@@ -273,7 +278,7 @@ app.get(["/health", "/api/health"], (_req, res) => res.json({
   ok: true,
   providerConfigured: true,
   providerKeyConfigured: Boolean(process.env.TEJHQ_API_KEY && process.env.TEJHQ_API_KEY !== "replace_with_your_free_key"),
-  aiConfigured: Boolean(process.env.LLM_API_KEY),
+  aiConfigured: Boolean(process.env.GEMINI_API_KEY || process.env.LLM_API_KEY),
   provider: "TejHQ",
   now: new Date().toISOString()
 }));
@@ -1035,17 +1040,28 @@ app.post("/api/ask", async (req, res, next) => {
       research = { retrievalError: e.message };
     }
 
-    if (!process.env.LLM_API_KEY) {
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.LLM_API_KEY || "").trim();
+    if (!apiKey) {
       return res.json({
         symbol,
-        answer: "AI is not configured. Add an OpenAI-compatible key to server/.env. Retrieved TejHQ price and corporate-actions data is shown below; no AI analysis has been fabricated.",
+        answer: "AI is not configured. Add a Gemini API key (GEMINI_API_KEY or LLM_API_KEY) in environment variables. Retrieved TejHQ price and corporate-actions data is shown below; no AI analysis has been fabricated.",
         sources: research,
         aiConfigured: false
       });
     }
 
-    const base = (process.env.LLM_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-    
+    const base = (
+      process.env.GEMINI_BASE_URL ||
+      process.env.LLM_BASE_URL ||
+      "https://generativelanguage.googleapis.com/v1beta/openai"
+    ).trim().replace(/\/+$/, "");
+
+    const configuredModel = (process.env.GEMINI_MODEL || process.env.LLM_MODEL || "gemini-3.8-flash").trim();
+    const candidateModels = [configuredModel];
+    for (const fallback of ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]) {
+      if (!candidateModels.includes(fallback)) candidateModels.push(fallback);
+    }
+
     // Compact context to avoid token exhaustion and rate limits
     const compactResearch = {
       priceSummary: Array.isArray(research.recentOhlcv) && research.recentOhlcv.length > 0 ? {
@@ -1058,35 +1074,59 @@ app.post("/api/ask", async (req, res, next) => {
         : []
     };
 
-    const response = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.LLM_API_KEY}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.CLIENT_ORIGIN || "http://localhost:5173",
-        "X-Title": "FINN Intelligence"
-      },
-      body: JSON.stringify({
-        model: process.env.LLM_MODEL || "gpt-4o-mini",
-        temperature: 0.1,
-        messages: [
-          {
-            role: "system",
-            content: `You are FINN, an investment research assistant. Use ONLY the company-related source material in the retrieved data and user-provided context. The available data from TejHQ is end-of-day price history and corporate actions (dividends, splits, bonuses, mergers). Company financials (P/E, EPS, revenue, margins), filing documents, and earnings-call transcripts are NOT available through the configured data provider. Do not invent financial figures. If evidence is missing, say so clearly. Separate facts from interpretation. Never present this as personalised investment advice.`
-          },
-          {
-            role: "user",
-            content: JSON.stringify({ symbol, question, marketData: compactResearch, extraDocumentContext: context.slice(0, 2000) })
-          }
-        ]
-      }),
-      signal: AbortSignal.timeout(45000)
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(body?.error?.message || `LLM returned HTTP ${response.status}`), { status: response.status });
-    const UNAVAILABLE_NOTE = "Filing documents and earnings call transcripts are sourced from exchange filings.";
+    let reply = null;
+    let lastError = null;
 
-    res.json({ symbol, answer: body.choices?.[0]?.message?.content || "The model returned no answer.", sources: research, aiConfigured: true });
+    for (const modelToTry of candidateModels) {
+      try {
+        const response = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: modelToTry,
+            temperature: 0.1,
+            messages: [
+              {
+                role: "system",
+                content: `You are FINN, an investment research assistant. Use ONLY the company-related source material in the retrieved data and user-provided context. The available data from TejHQ is end-of-day price history and corporate actions (dividends, splits, bonuses, mergers). Company financials (P/E, EPS, revenue, margins), filing documents, and earnings-call transcripts are NOT available through the configured data provider. Do not invent financial figures. If evidence is missing, say so clearly. Separate facts from interpretation. Never present this as personalised investment advice.`
+              },
+              {
+                role: "user",
+                content: JSON.stringify({ symbol, question, marketData: compactResearch, extraDocumentContext: context.slice(0, 2000) })
+              }
+            ]
+          }),
+          signal: AbortSignal.timeout(45000)
+        });
+
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
+          const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
+          if (response.status === 503 && candidateModels.indexOf(modelToTry) < candidateModels.length - 1) {
+            console.warn(`[AI Research] ${modelToTry} 503 high demand. Trying fallback ${candidateModels[candidateModels.indexOf(modelToTry) + 1]}...`);
+            continue;
+          }
+          throw Object.assign(new Error(errorMsg), { status: response.status });
+        }
+
+        reply = body.choices?.[0]?.message?.content || "The model returned no answer.";
+        break;
+      } catch (err) {
+        lastError = err;
+        if (candidateModels.indexOf(modelToTry) < candidateModels.length - 1 && err.status === 503) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!reply && lastError) throw lastError;
+
+    res.json({ symbol, answer: reply, sources: research, aiConfigured: true });
   } catch (e) { next(e); }
 });
 
