@@ -1,0 +1,19 @@
+{
+  "name": "finn-intelligence-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch-path=index.js --watch-path=companyDirectory.js --watch-path=pushEngine.js --watch-path=auth.js --watch-path=db.js index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.3"
+  }
+}

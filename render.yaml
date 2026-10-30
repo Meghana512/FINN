@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: finn-intelligence-api
+    env: node
+    plan: starter
+    region: oregon
+    rootDir: finn-intelligence/server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: finn-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_PATH
+        value: /var/data/finn.db
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: TEJHQ_BASE_URL
+        value: https://api.tejhq.dev
+      - key: TEJHQ_API_KEY
+        sync: false
+      - key: TEJHQ_EXCHANGE
+        value: nse
+      - key: LLM_BASE_URL
+        value: https://api.openai.com/v1
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+
