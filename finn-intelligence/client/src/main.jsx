@@ -10,7 +10,7 @@ import ReactMarkdown from "react-markdown";
 import "./styles.css";
 import { PushInboxPage, AlertsAndRulesPage, NotificationDrawer } from "./PushComponents.jsx";
 
-import { api, API } from "./api.js";
+import { api, API, askFinnStream } from "./api.js";
 const DEFAULT_SYMBOLS = ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","LT","ITC","BHARTIARTL","SBIN","AXISBANK","M&M","SUNPHARMA","MARUTI","TATAMOTORS","TITAN","WIPRO","HINDUNILVR","BAJFINANCE"];
 const money = n => n == null || !Number.isFinite(Number(n)) ? "—" : `₹${Number(n).toLocaleString("en-IN",{maximumFractionDigits:2})}`;
 const pct = n => n == null || !Number.isFinite(Number(n)) ? "—" : `${Number(n)>0?"+":""}${Number(n).toFixed(2)}%`;
@@ -450,18 +450,36 @@ function App() {
     if (!promptToUse.trim()) return;
     setAsking(true);
     setAnswer(null);
+
+    // Trim context: only pass compact digest, not full documents JSON
+    const context = research ? JSON.stringify({
+      digest: research.digest
+    }).slice(0, 1000) : "";
+
+    // Accumulate streamed text
+    let accumulated = "";
+
     try {
-      const context = research ? JSON.stringify({
-        digest: research.digest,
-        documents: research.documents,
-        earningsCalls: research.earningsCalls
-      }) : "";
-      const result = await api("/api/ask", {
-        method: "POST",
-        body: JSON.stringify({ symbol, question: promptToUse, context }),
-        timeoutMs: 120000
-      });
-      setAnswer(result);
+      await askFinnStream(
+        { symbol, question: promptToUse, context },
+        // onDelta: show progressive output token-by-token
+        (delta) => {
+          accumulated += delta;
+          setAnswer(prev => ({
+            ...(prev || {}),
+            answer: accumulated,
+            aiConfigured: true,
+            isStreaming: true
+          }));
+        },
+        // onDone: replace with final result (includes sources, timings)
+        (finalResult) => {
+          setAnswer({
+            ...finalResult,
+            isStreaming: false
+          });
+        }
+      );
     } catch (e) {
       const isTimeout = /timeout|aborted|timed out/i.test(e.message);
       setAnswer({
@@ -583,7 +601,7 @@ function App() {
               <label className="field-label">YOUR RESEARCH QUESTION</label>
               <textarea value={question} onChange={e=>setQuestion(e.target.value)} rows="5" placeholder="Compare guidance with reported results. Cite primary sources."/>
               <button className="primary-btn full" onClick={()=>askFinn(question)} disabled={asking||!question.trim()}>{asking?<LoaderCircle size={16} className="spin"/>:<Sparkles size={16}/>} {asking ? "Synthesizing research..." : "Analyse with sources"}</button>
-              {asking && (
+              {asking && !answer?.answer && (
                 <div className="answer-block" style={{ borderStyle: "dashed", borderColor: "#2a523d", background: "#0e1814" }}>
                   <div className="answer-label" style={{ color: "#67e0a3" }}>
                     <LoaderCircle size={14} className="spin" />
@@ -596,6 +614,18 @@ function App() {
                     <small style={{ color: "#748498" }}>
                       Deep research with Google Gemini typically takes 15–45 seconds. Please keep this tab open.
                     </small>
+                  </div>
+                </div>
+              )}
+              {/* Progressive streaming output: show partial answer while still synthesizing */}
+              {asking && answer?.answer && (
+                <div className="answer-block" style={{ borderStyle: "dashed", borderColor: "#2a523d", background: "#0e1814" }}>
+                  <div className="answer-label" style={{ color: "#67e0a3" }}>
+                    <LoaderCircle size={14} className="spin" />
+                    <span>STREAMING SYNTHESIS...</span>
+                  </div>
+                  <div style={{ marginTop: "10px" }}>
+                    <SafeMarkdown content={answer.answer} />
                   </div>
                 </div>
               )}
@@ -624,6 +654,12 @@ function App() {
                       <summary>Inspect retrieved evidence payload</summary>
                       <pre className="data-digest" style={{ marginTop: "8px" }}>{JSON.stringify(answer.sources, null, 2)}</pre>
                     </details>
+                  )}
+                  {answer._timings && !answer.isError && (
+                    <div style={{ marginTop: "8px", fontSize: "10px", color: "#748498", fontFamily: "monospace" }}>
+                      ⏱ retrieval {answer._timings.retrieval_ms ?? "—"}ms · gemini {answer._timings.gemini_ms ?? "—"}ms · total {answer._timings.total_ms ?? "—"}ms
+                      {answer.cached && " · ✓ cached"}
+                    </div>
                   )}
                 </div>
               )}

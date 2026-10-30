@@ -33,3 +33,10 @@ services:
         sync: false
       - key: LLM_MODEL
         value: gemini-3.8-flash
+      # Ask FINN latency tuning (all optional — defaults shown)
+      - key: LLM_TIMEOUT_MS
+        value: 120000
+      - key: LLM_MAX_TOKENS
+        value: 600
+      - key: ASK_CACHE_TTL_MS
+        value: 300000

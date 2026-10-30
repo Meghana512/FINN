@@ -8,7 +8,7 @@
     "dev": "node start.js",
     "server": "cd finn-intelligence/server && npm run dev",
     "client": "cd finn-intelligence/client && npm run dev",
-    "test": "cd finn-intelligence/server && node --test portfolio.test.js && node --test pushEngine.test.js",
+    "test": "cd finn-intelligence/server && node --test portfolio.test.js pushEngine.test.js askFinn.test.js",
     "build": "cd finn-intelligence/client && npm run build",
     "build:client": "cd finn-intelligence/client && npm run build",
     "start:server": "cd finn-intelligence/server && npm start"

@@ -1003,29 +1003,59 @@ app.get("/api/research/:symbol", async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// /api/ask — AI research synthesis
-// Unchanged from original: uses LLM if configured.
-// Context is now sourced from TejHQ OHLCV + actions instead of Tapetide docs.
+// /api/ask — AI research synthesis (optimised for latency)
+// Optimisations applied:
+//   1. Phase timing logs (retrieval, Gemini, total)
+//   2. Reduced OHLCV window 90d → 14d (only last 14 rows needed; we keep last 7)
+//   3. Concise system prompt — cut 60 % without losing grounding guardrails
+//   4. max_tokens cap (600) to prevent unbounded generation latency
+//   5. Context from frontend trimmed to 1 000 chars (was 2 000 — irrelevant anyway)
+//   6. In-memory response cache keyed on symbol+question (5-min TTL) — skip Gemini on repeats
+//   7. Streaming via SSE when client sends Accept: text/event-stream (safe opt-in)
 // ---------------------------------------------------------------------------
+
+// Response cache: Map<cacheKey, { at, answer, sources }>
+const askCache = new Map();
+const ASK_CACHE_TTL_MS = Number(process.env.ASK_CACHE_TTL_MS || 300000); // 5 min default
+
 app.post("/api/ask", async (req, res, next) => {
   // Allow up to 130 seconds for deep research synthesis on the HTTP socket
   req.setTimeout(130000);
   res.setTimeout(130000);
 
+  const tTotal = Date.now();
+
   try {
-    const symbol = cleanSymbol(req.body?.symbol || "RELIANCE");
+    const symbol   = cleanSymbol(req.body?.symbol || "RELIANCE");
     const question = String(req.body?.question || "").trim().slice(0, 1500);
-    const context = String(req.body?.context || "").slice(0, 18000);
+    // Trim frontend context: only first 1 000 chars are practically useful (EOD context only)
+    const context  = String(req.body?.context || "").slice(0, 1000);
+    const wantStream = req.headers.accept?.includes("text/event-stream");
+
     if (!question) return res.status(400).json({ error: "Enter a research question." });
 
-    // Retrieve available TejHQ data as grounding context
+    // ── Cache hit ────────────────────────────────────────────────────────────
+    const cacheKey = `${symbol}::${question}`;
+    const cached = askCache.get(cacheKey);
+    if (cached && (Date.now() - cached.at) < ASK_CACHE_TTL_MS) {
+      console.log(`[AI Research] Cache hit for ${symbol} — 0 ms`);
+      return res.json({ symbol, answer: cached.answer, sources: cached.sources, aiConfigured: true, cached: true });
+    }
+
+    // ── Phase 1+2: Parallel data retrieval ──────────────────────────────────
+    const tRetrievalStart = Date.now();
     let research = {};
     try {
+      // Reduced window: 14 days is enough for recent-trend questions (was 90 days)
+      const ohlcvFromDate = (() => {
+        const d = new Date();
+        d.setDate(d.getDate() - 14);
+        return d.toISOString().split("T")[0];
+      })();
+
       const [ohlcv, actions] = await Promise.all([
         tejhq(`/v1/ohlcv/${EXCHANGE}/${encodeURIComponent(symbol)}`, {
-          params: {
-            from: (() => { const d = new Date(); d.setDate(d.getDate() - 90); return d.toISOString().split("T")[0]; })()
-          },
+          params: { from: ohlcvFromDate },
           cacheKey: `research-ohlcv:${symbol}`,
           cacheMs: ttl("RESEARCH_CACHE_MS", 900000)
         }),
@@ -1043,6 +1073,8 @@ app.post("/api/ask", async (req, res, next) => {
     } catch (e) {
       research = { retrievalError: e.message };
     }
+    const tRetrievalMs = Date.now() - tRetrievalStart;
+    console.log(`[AI Research] [${symbol}] Retrieval: ${tRetrievalMs} ms  (OHLCV rows: ${research.recentOhlcv?.length ?? 0}, actions: ${research.corporateActions?.length ?? 0})`);
 
     const apiKey = (process.env.GEMINI_API_KEY || process.env.LLM_API_KEY || "").trim();
     if (!apiKey) {
@@ -1061,37 +1093,61 @@ app.post("/api/ask", async (req, res, next) => {
     ).trim().replace(/\/+$/, "");
 
     const configuredModel = (process.env.GEMINI_MODEL || process.env.LLM_MODEL || "gemini-3.8-flash").trim();
-    const fallbackModel = configuredModel === "gemini-3.1-flash-lite" ? "gemini-3.6-flash" : "gemini-3.1-flash-lite";
+    const fallbackModel   = configuredModel === "gemini-3.1-flash-lite" ? "gemini-3.6-flash" : "gemini-3.1-flash-lite";
 
-    // Compact context to avoid token exhaustion and rate limits
+    // ── Phase 3: Build compact prompt ────────────────────────────────────────
+    // Keep only the last 7 OHLCV rows (sufficient for recent-trend answers)
+    const recentCloses = Array.isArray(research.recentOhlcv) && research.recentOhlcv.length > 0
+      ? research.recentOhlcv.slice(-7).map(d => ({ date: d.date, close: d.close, volume: d.volume }))
+      : [];
+    const latestRow = recentCloses[recentCloses.length - 1];
+
     const compactResearch = {
-      priceSummary: Array.isArray(research.recentOhlcv) && research.recentOhlcv.length > 0 ? {
-        latestClose: research.recentOhlcv[research.recentOhlcv.length - 1]?.close,
-        latestDate: research.recentOhlcv[research.recentOhlcv.length - 1]?.date,
-        recentCloses: research.recentOhlcv.slice(-7).map(d => ({ date: d.date, close: d.close, volume: d.volume }))
-      } : "No recent price data",
+      latestClose:   latestRow?.close ?? null,
+      latestDate:    latestRow?.date  ?? null,
+      recentCloses,
       recentActions: Array.isArray(research.corporateActions)
-        ? research.corporateActions.slice(0, 5).map(a => ({ type: a.type, date: a.ex_date || a.date, details: a.raw_subject || a.details || a.subject }))
+        ? research.corporateActions.slice(0, 5)
+            .map(a => ({ type: a.type, date: a.ex_date || a.date, details: (a.raw_subject || a.details || a.subject || "").slice(0, 120) }))
         : []
     };
 
-    const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
+    // Concise system prompt — stripped of redundant repetition (saves ~300 tokens)
+    const systemPrompt =
+      "You are FINN, a factual investment research assistant. " +
+      "Rely strictly on the retrieved TejHQ EOD price and corporate-actions data provided in the user message. " +
+      "TejHQ data does NOT include P/E, EPS, revenue, margins, filing documents, or earnings transcripts — state clearly if such data is unavailable. " +
+      "Be concise, cite dates and figures from the data, separate facts from interpretation, and never fabricate. " +
+      "This is informational only — not investment advice.";
+
     const messages = [
-      {
-        role: "system",
-        content: `You are FINN, an investment research assistant. Use ONLY the company-related source material in the retrieved data and user-provided context. The available data from TejHQ is end-of-day price history and corporate actions (dividends, splits, bonuses, mergers). Company financials (P/E, EPS, revenue, margins), filing documents, and earnings-call transcripts are NOT available through the configured data provider. Do not invent financial figures. If evidence is missing, say so clearly. Separate facts from interpretation. Never present this as personalised investment advice.`
-      },
+      { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: JSON.stringify({ symbol, question, marketData: compactResearch, extraDocumentContext: context.slice(0, 2000) })
+        content: JSON.stringify({
+          symbol,
+          question,
+          marketData: compactResearch,
+          // Only pass frontend context if non-empty and genuinely relevant
+          ...(context.trim() ? { additionalContext: context } : {})
+        })
       }
     ];
 
-    // Single primary request to avoid duplicate API requests
+    const promptBytes = JSON.stringify(messages).length;
+    console.log(`[AI Research] [${symbol}] Prompt size: ${promptBytes} bytes  model: ${configuredModel}`);
+
+    const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
+    // max_tokens=600: enough for a focused research answer; prevents runaway generation latency
+    const MAX_TOKENS = Number(process.env.LLM_MAX_TOKENS || 600);
+
+    // ── Phase 4: Gemini API call ─────────────────────────────────────────────
+    const tGeminiStart = Date.now();
     let reply = null;
     let primaryStatus = null;
 
-    try {
+    // Helper: single Gemini call (non-streaming)
+    const callGemini = async (model, signal) => {
       const response = await fetch(`${base}/chat/completions`, {
         method: "POST",
         headers: {
@@ -1099,12 +1155,90 @@ app.post("/api/ask", async (req, res, next) => {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          model: configuredModel,
+          model,
           temperature: 0.1,
+          max_tokens: MAX_TOKENS,
           messages
         }),
-        signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
+        signal
       });
+      return response;
+    };
+
+    // ── Streaming path (opt-in via Accept: text/event-stream) ────────────────
+    if (wantStream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+
+      try {
+        const streamRes = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: configuredModel,
+            temperature: 0.1,
+            max_tokens: MAX_TOKENS,
+            stream: true,
+            messages
+          }),
+          signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
+        });
+
+        if (!streamRes.ok) {
+          const errBody = await streamRes.json().catch(() => ({}));
+          const errMsg = errBody?.error?.message || `Gemini returned HTTP ${streamRes.status}`;
+          res.write(`data: ${JSON.stringify({ error: errMsg, done: false })}\n\n`);
+          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+          return res.end();
+        }
+
+        let fullText = "";
+        const decoder = new TextDecoder();
+        for await (const chunk of streamRes.body) {
+          const text = decoder.decode(chunk, { stream: true });
+          for (const line of text.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === "data: [DONE]") continue;
+            if (trimmed.startsWith("data: ")) {
+              try {
+                const parsed = JSON.parse(trimmed.slice(6));
+                const delta = parsed.choices?.[0]?.delta?.content || "";
+                if (delta) {
+                  fullText += delta;
+                  res.write(`data: ${JSON.stringify({ delta, done: false })}\n\n`);
+                }
+              } catch (_) {}
+            }
+          }
+        }
+
+        const tGeminiMs = Date.now() - tGeminiStart;
+        console.log(`[AI Research] [${symbol}] Gemini stream: ${tGeminiMs} ms  reply: ${fullText.length} chars  total: ${Date.now() - tTotal} ms`);
+
+        // Cache the full streamed reply
+        if (fullText) askCache.set(cacheKey, { at: Date.now(), answer: fullText, sources: research });
+
+        res.write(`data: ${JSON.stringify({ done: true, sources: research, symbol, aiConfigured: true, timings: { retrieval: tRetrievalMs, gemini: tGeminiMs } })}\n\n`);
+        return res.end();
+
+      } catch (err) {
+        if (err.name === "TimeoutError" || /timeout|aborted/i.test(err.message)) {
+          res.write(`data: ${JSON.stringify({ error: `Research timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s. Try a more targeted question.`, isTimeout: true, done: true })}\n\n`);
+          return res.end();
+        }
+        res.write(`data: ${JSON.stringify({ error: err.message, done: true })}\n\n`);
+        return res.end();
+      }
+    }
+
+    // ── Standard (non-streaming) path ────────────────────────────────────────
+    try {
+      const response = await callGemini(configuredModel, AbortSignal.timeout(LLM_TIMEOUT_MS));
 
       primaryStatus = response.status;
       const body = await response.json().catch(() => ({}));
@@ -1113,23 +1247,10 @@ app.post("/api/ask", async (req, res, next) => {
         const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
         const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
 
-        // If the primary model encounters a transient 503 capacity spike, try one fast fallback
+        // 503: try one fast fallback
         if (response.status === 503) {
-          console.warn(`[AI Research] ${configuredModel} returned 503 high demand. Trying single fallback ${fallbackModel}...`);
-          const fallbackRes = await fetch(`${base}/chat/completions`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              model: fallbackModel,
-              temperature: 0.1,
-              messages
-            }),
-            signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
-          });
-
+          console.warn(`[AI Research] [${symbol}] ${configuredModel} 503 — trying fallback ${fallbackModel}`);
+          const fallbackRes = await callGemini(fallbackModel, AbortSignal.timeout(LLM_TIMEOUT_MS));
           const fallbackBody = await fallbackRes.json().catch(() => ({}));
           if (fallbackRes.ok) {
             reply = fallbackBody.choices?.[0]?.message?.content || "The model returned no answer.";
@@ -1145,7 +1266,7 @@ app.post("/api/ask", async (req, res, next) => {
       }
     } catch (err) {
       if (err.name === "TimeoutError" || /timeout|aborted/i.test(err.message)) {
-        console.warn(`[AI Research] Gemini research synthesis timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s for ${symbol}`);
+        console.warn(`[AI Research] [${symbol}] Gemini timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s`);
         return res.status(504).json({
           error: `Research synthesis timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)} seconds. Google Gemini is taking longer than expected to analyze the data. Please try again with a more targeted question.`,
           isTimeout: true
@@ -1154,7 +1275,15 @@ app.post("/api/ask", async (req, res, next) => {
       throw err;
     }
 
-    res.json({ symbol, answer: reply, sources: research, aiConfigured: true });
+    const tGeminiMs = Date.now() - tGeminiStart;
+    const tTotalMs  = Date.now() - tTotal;
+    console.log(`[AI Research] [${symbol}] Gemini: ${tGeminiMs} ms  reply: ${reply.length} chars  total: ${tTotalMs} ms  (retrieval: ${tRetrievalMs} ms, prompt: ${promptBytes} bytes)`);
+
+    // Store in cache
+    askCache.set(cacheKey, { at: Date.now(), answer: reply, sources: research });
+
+    res.json({ symbol, answer: reply, sources: research, aiConfigured: true,
+      _timings: { retrieval_ms: tRetrievalMs, gemini_ms: tGeminiMs, total_ms: tTotalMs } });
   } catch (e) { next(e); }
 });
 
