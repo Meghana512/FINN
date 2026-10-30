@@ -28,8 +28,8 @@ services:
       - key: TEJHQ_EXCHANGE
         value: nse
       - key: LLM_BASE_URL
-        value: https://api.openai.com/v1
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
       - key: LLM_API_KEY
         sync: false
       - key: LLM_MODEL
-        value: gpt-4o-mini
+        value: gemini-3.8-flash
