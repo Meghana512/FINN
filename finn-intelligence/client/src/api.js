@@ -21,7 +21,7 @@ if (import.meta.env.PROD && !rawApiBase) {
 /**
  * Perform authenticated or unauthenticated API request to FINN backend
  * @param {string} path - URL path starting with /api/
- * @param {RequestInit} [options] - Fetch options
+ * @param {RequestInit & { timeoutMs?: number }} [options] - Fetch options with custom timeout
  */
 export async function api(path, options = {}) {
   const token = localStorage.getItem("finn_token");
@@ -33,22 +33,46 @@ export async function api(path, options = {}) {
     ...(options?.headers || {})
   };
 
-  const response = await fetch(url, {
-    ...options,
-    headers
-  });
+  // Allow up to 120 seconds for deep research synthesis (/api/ask), 30s for standard API calls
+  const timeoutMs = options.timeoutMs || (path.startsWith("/api/ask") ? 120000 : 30000);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
+  }, timeoutMs);
 
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const errorMsg =
-      data.error ||
-      (response.status === 401
-        ? "Session expired or authentication required. Please sign in again."
-        : `Request failed with status ${response.status}`);
-    throw new Error(errorMsg);
+  if (options.signal) {
+    options.signal.addEventListener("abort", () => controller.abort(options.signal.reason));
   }
 
-  return data;
-}
+  try {
+    const response = await fetch(url, {
+      ...options,
+      headers,
+      signal: controller.signal
+    });
 
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const errorMsg =
+        data.error ||
+        (response.status === 401
+          ? "Session expired or authentication required. Please sign in again."
+          : `Request failed with status ${response.status}`);
+      throw new Error(errorMsg);
+    }
+
+    return data;
+  } catch (err) {
+    if (err.name === "AbortError" || /aborted|timed out/i.test(err.message)) {
+      throw new Error(
+        err.message.includes("timed out")
+          ? err.message
+          : `The operation was aborted due to timeout (${Math.round(timeoutMs / 1000)}s limit reached).`
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}

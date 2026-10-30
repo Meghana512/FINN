@@ -445,15 +445,36 @@ function App() {
     catch(e){setError(e.message);}
     finally{setResearchLoading(false);}
   };
-  const askFinn=async(q=question)=>{
+  const askFinn = async (q = question) => {
     const promptToUse = q || question;
-    if(!promptToUse.trim()) return;
-    setAsking(true);setAnswer(null);
+    if (!promptToUse.trim()) return;
+    setAsking(true);
+    setAnswer(null);
     try {
-      const context = research ? JSON.stringify({digest:research.digest,documents:research.documents,earningsCalls:research.earningsCalls}) : "";
-      setAnswer(await api("/api/ask",{method:"POST",body:JSON.stringify({symbol,question:promptToUse,context})}));
-    } catch(e){setAnswer({answer:e.message,aiConfigured:false});}
-    finally{setAsking(false);}
+      const context = research ? JSON.stringify({
+        digest: research.digest,
+        documents: research.documents,
+        earningsCalls: research.earningsCalls
+      }) : "";
+      const result = await api("/api/ask", {
+        method: "POST",
+        body: JSON.stringify({ symbol, question: promptToUse, context }),
+        timeoutMs: 120000
+      });
+      setAnswer(result);
+    } catch (e) {
+      const isTimeout = /timeout|aborted|timed out/i.test(e.message);
+      setAnswer({
+        answer: isTimeout
+          ? "The research synthesis took longer than expected to complete (120s timeout limit reached).\n\nYour research question is saved above — click **Retry Analysis** or rephrase to try again."
+          : e.message,
+        aiConfigured: false,
+        isError: true,
+        isTimeout
+      });
+    } finally {
+      setAsking(false);
+    }
   };
 
 
@@ -561,17 +582,47 @@ function App() {
               </div>
               <label className="field-label">YOUR RESEARCH QUESTION</label>
               <textarea value={question} onChange={e=>setQuestion(e.target.value)} rows="5" placeholder="Compare guidance with reported results. Cite primary sources."/>
-              <button className="primary-btn full" onClick={()=>askFinn(question)} disabled={asking||!question.trim()}>{asking?<LoaderCircle size={16} className="spin"/>:<Sparkles size={16}/>} Analyse with sources</button>
-              {answer&&(
-                <div className="answer-block">
-                  <div className="answer-label"><ShieldCheck size={15}/> {answer.aiConfigured?"AI SYNTHESIS":"RETRIEVAL NOTICE"}</div>
+              <button className="primary-btn full" onClick={()=>askFinn(question)} disabled={asking||!question.trim()}>{asking?<LoaderCircle size={16} className="spin"/>:<Sparkles size={16}/>} {asking ? "Synthesizing research..." : "Analyse with sources"}</button>
+              {asking && (
+                <div className="answer-block" style={{ borderStyle: "dashed", borderColor: "#2a523d", background: "#0e1814" }}>
+                  <div className="answer-label" style={{ color: "#67e0a3" }}>
+                    <LoaderCircle size={14} className="spin" />
+                    <span>FINN RESEARCH IN PROGRESS...</span>
+                  </div>
+                  <div style={{ marginTop: "10px", color: "#c1cddb", fontSize: "11px", lineHeight: 1.7 }}>
+                    <p style={{ margin: "0 0 6px" }}>
+                      Analyzing verified market data and generating primary source synthesis for <b>{symbol}</b>.
+                    </p>
+                    <small style={{ color: "#748498" }}>
+                      Deep research with Google Gemini typically takes 15–45 seconds. Please keep this tab open.
+                    </small>
+                  </div>
+                </div>
+              )}
+              {answer && !asking && (
+                <div className={`answer-block ${answer.isError ? "error" : ""}`} style={answer.isError ? { borderColor: "#64262b", background: "#1b1114" } : {}}>
+                  <div className="answer-label" style={{ color: answer.isError ? "#ff9ea2" : "#9ce6bc" }}>
+                    {answer.isError ? <CircleAlert size={15} /> : <ShieldCheck size={15} />}
+                    <span>{answer.isError ? (answer.isTimeout ? "RESEARCH QUERY TIMED OUT" : "RESEARCH ERROR") : (answer.aiConfigured ? "AI SYNTHESIS" : "RETRIEVAL NOTICE")}</span>
+                  </div>
                   <div style={{ marginTop: "10px" }}>
                     <SafeMarkdown content={answer.answer} />
                   </div>
-                  {answer.sources&&(
+                  {answer.isError && (
+                    <div style={{ marginTop: "12px", display: "flex", gap: "8px" }}>
+                      <button
+                        className="secondary-btn"
+                        style={{ fontSize: "11px", padding: "6px 12px", display: "inline-flex", alignItems: "center", gap: "6px" }}
+                        onClick={() => askFinn(question)}
+                      >
+                        <RefreshCw size={12} /> Retry Analysis
+                      </button>
+                    </div>
+                  )}
+                  {answer.sources && !answer.isError && (
                     <details style={{ marginTop: "12px" }}>
                       <summary>Inspect retrieved evidence payload</summary>
-                      <pre className="data-digest" style={{ marginTop: "8px" }}>{JSON.stringify(answer.sources,null,2)}</pre>
+                      <pre className="data-digest" style={{ marginTop: "8px" }}>{JSON.stringify(answer.sources, null, 2)}</pre>
                     </details>
                   )}
                 </div>

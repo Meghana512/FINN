@@ -1008,6 +1008,10 @@ app.get("/api/research/:symbol", async (req, res, next) => {
 // Context is now sourced from TejHQ OHLCV + actions instead of Tapetide docs.
 // ---------------------------------------------------------------------------
 app.post("/api/ask", async (req, res, next) => {
+  // Allow up to 130 seconds for deep research synthesis on the HTTP socket
+  req.setTimeout(130000);
+  res.setTimeout(130000);
+
   try {
     const symbol = cleanSymbol(req.body?.symbol || "RELIANCE");
     const question = String(req.body?.question || "").trim().slice(0, 1500);
@@ -1057,10 +1061,7 @@ app.post("/api/ask", async (req, res, next) => {
     ).trim().replace(/\/+$/, "");
 
     const configuredModel = (process.env.GEMINI_MODEL || process.env.LLM_MODEL || "gemini-3.8-flash").trim();
-    const candidateModels = [configuredModel];
-    for (const fallback of ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]) {
-      if (!candidateModels.includes(fallback)) candidateModels.push(fallback);
-    }
+    const fallbackModel = configuredModel === "gemini-3.1-flash-lite" ? "gemini-3.6-flash" : "gemini-3.1-flash-lite";
 
     // Compact context to avoid token exhaustion and rate limits
     const compactResearch = {
@@ -1074,57 +1075,84 @@ app.post("/api/ask", async (req, res, next) => {
         : []
     };
 
+    const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
+    const messages = [
+      {
+        role: "system",
+        content: `You are FINN, an investment research assistant. Use ONLY the company-related source material in the retrieved data and user-provided context. The available data from TejHQ is end-of-day price history and corporate actions (dividends, splits, bonuses, mergers). Company financials (P/E, EPS, revenue, margins), filing documents, and earnings-call transcripts are NOT available through the configured data provider. Do not invent financial figures. If evidence is missing, say so clearly. Separate facts from interpretation. Never present this as personalised investment advice.`
+      },
+      {
+        role: "user",
+        content: JSON.stringify({ symbol, question, marketData: compactResearch, extraDocumentContext: context.slice(0, 2000) })
+      }
+    ];
+
+    // Single primary request to avoid duplicate API requests
     let reply = null;
-    let lastError = null;
+    let primaryStatus = null;
 
-    for (const modelToTry of candidateModels) {
-      try {
-        const response = await fetch(`${base}/chat/completions`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: modelToTry,
-            temperature: 0.1,
-            messages: [
-              {
-                role: "system",
-                content: `You are FINN, an investment research assistant. Use ONLY the company-related source material in the retrieved data and user-provided context. The available data from TejHQ is end-of-day price history and corporate actions (dividends, splits, bonuses, mergers). Company financials (P/E, EPS, revenue, margins), filing documents, and earnings-call transcripts are NOT available through the configured data provider. Do not invent financial figures. If evidence is missing, say so clearly. Separate facts from interpretation. Never present this as personalised investment advice.`
-              },
-              {
-                role: "user",
-                content: JSON.stringify({ symbol, question, marketData: compactResearch, extraDocumentContext: context.slice(0, 2000) })
-              }
-            ]
-          }),
-          signal: AbortSignal.timeout(45000)
-        });
+    try {
+      const response = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: configuredModel,
+          temperature: 0.1,
+          messages
+        }),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
+      });
 
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
-          const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
-          if (response.status === 503 && candidateModels.indexOf(modelToTry) < candidateModels.length - 1) {
-            console.warn(`[AI Research] ${modelToTry} 503 high demand. Trying fallback ${candidateModels[candidateModels.indexOf(modelToTry) + 1]}...`);
-            continue;
+      primaryStatus = response.status;
+      const body = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
+        const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
+
+        // If the primary model encounters a transient 503 capacity spike, try one fast fallback
+        if (response.status === 503) {
+          console.warn(`[AI Research] ${configuredModel} returned 503 high demand. Trying single fallback ${fallbackModel}...`);
+          const fallbackRes = await fetch(`${base}/chat/completions`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model: fallbackModel,
+              temperature: 0.1,
+              messages
+            }),
+            signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
+          });
+
+          const fallbackBody = await fallbackRes.json().catch(() => ({}));
+          if (fallbackRes.ok) {
+            reply = fallbackBody.choices?.[0]?.message?.content || "The model returned no answer.";
+          } else {
+            const fbError = Array.isArray(fallbackBody) ? fallbackBody[0]?.error?.message : fallbackBody?.error?.message;
+            throw Object.assign(new Error(fbError || `Gemini returned HTTP ${fallbackRes.status}`), { status: fallbackRes.status });
           }
+        } else {
           throw Object.assign(new Error(errorMsg), { status: response.status });
         }
-
+      } else {
         reply = body.choices?.[0]?.message?.content || "The model returned no answer.";
-        break;
-      } catch (err) {
-        lastError = err;
-        if (candidateModels.indexOf(modelToTry) < candidateModels.length - 1 && err.status === 503) {
-          continue;
-        }
-        throw err;
       }
+    } catch (err) {
+      if (err.name === "TimeoutError" || /timeout|aborted/i.test(err.message)) {
+        console.warn(`[AI Research] Gemini research synthesis timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s for ${symbol}`);
+        return res.status(504).json({
+          error: `Research synthesis timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)} seconds. Google Gemini is taking longer than expected to analyze the data. Please try again with a more targeted question.`,
+          isTimeout: true
+        });
+      }
+      throw err;
     }
-
-    if (!reply && lastError) throw lastError;
 
     res.json({ symbol, answer: reply, sources: research, aiConfigured: true });
   } catch (e) { next(e); }
@@ -1134,6 +1162,7 @@ app.post("/api/ask", async (req, res, next) => {
 // /api/alerts/evaluate — unchanged; operates on client-supplied quotes
 // ---------------------------------------------------------------------------
 app.post("/api/alerts/evaluate", (req, res) => {
+
   const quotes = Array.isArray(req.body?.quotes) ? req.body.quotes : [];
   const rules = req.body?.rules || {};
   const priceMovePct = Number(rules.priceMovePct ?? 3);
