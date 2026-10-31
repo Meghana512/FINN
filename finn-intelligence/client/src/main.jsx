@@ -28,7 +28,20 @@ function SafeMarkdown({ content, fallback = "No content available." }) {
   if (!content) return <p style={{ color: "#748498", fontStyle: "italic" }}>{fallback}</p>;
   return (
     <div className="markdown-prose">
-      <ReactMarkdown>{String(content)}</ReactMarkdown>
+      <ReactMarkdown
+        components={{
+          a: ({ node, ...props }) => (
+            <a
+              {...props}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "#5eead4", textDecoration: "underline", fontWeight: 500 }}
+            />
+          )
+        }}
+      >
+        {String(content)}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -635,6 +648,51 @@ function App() {
                     {answer.isError ? <CircleAlert size={15} /> : <ShieldCheck size={15} />}
                     <span>{answer.isError ? (answer.isTimeout ? "RESEARCH QUERY TIMED OUT" : "RESEARCH ERROR") : (answer.aiConfigured ? "AI SYNTHESIS" : "RETRIEVAL NOTICE")}</span>
                   </div>
+
+                  {/* Grounded Evidence Metadata & Reporting Periods */}
+                  {answer.sources?.dataAvailability && !answer.isError && (
+                    <div style={{ marginTop: "10px", padding: "8px 10px", borderRadius: "6px", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)", fontSize: "11px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginBottom: "6px" }}>
+                        <span style={{ color: "#748498", fontWeight: 600 }}>EVIDENCE GROUNDING:</span>
+                        {answer.sources.dataAvailability.financialsAvailable && (
+                          <span className="pill" style={{ fontSize: "10px", padding: "2px 6px", background: "#1a3b2b", color: "#67e0a3", border: "1px solid #2ea86f" }}>
+                            ✓ Actuals ({answer.sources.dataAvailability.reportingPeriods?.join(", ") || "Filed"})
+                          </span>
+                        )}
+                        {answer.sources.dataAvailability.guidanceAvailable ? (
+                          <span className="pill" style={{ fontSize: "10px", padding: "2px 6px", background: "#1a2c3b", color: "#60a5fa", border: "1px solid #3b82f6" }}>
+                            ✓ Management Guidance Indexed
+                          </span>
+                        ) : (
+                          <span className="pill neutral" style={{ fontSize: "10px", padding: "2px 6px" }}>
+                            — Guidance: Not Disclosed
+                          </span>
+                        )}
+                        {answer.sources.dataAvailability.documentsAvailable && (
+                          <span className="pill" style={{ fontSize: "10px", padding: "2px 6px", background: "#332211", color: "#fbbf24", border: "1px solid #d97706" }}>
+                            ✓ {answer.sources.dataAvailability.documentCount || answer.sources.documents?.length || "Official"} Filings Verified
+                          </span>
+                        )}
+                      </div>
+                      {Array.isArray(answer.sources.documents) && answer.sources.documents.length > 0 && (
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", color: "#8b9bb4" }}>
+                          <span style={{ fontSize: "10px" }}>Verified Sources:</span>
+                          {answer.sources.documents.slice(0, 3).map((d, idx) => (
+                            <a
+                              key={d.id || idx}
+                              href={d.source_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{ color: "#5eead4", fontSize: "10px", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: "3px" }}
+                            >
+                              {d.title?.split("—")[1]?.trim() || d.title || d.doc_type} ↗
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div style={{ marginTop: "10px" }}>
                     <SafeMarkdown content={answer.answer} />
                   </div>
@@ -656,9 +714,13 @@ function App() {
                     </details>
                   )}
                   {answer._timings && !answer.isError && (
-                    <div style={{ marginTop: "8px", fontSize: "10px", color: "#748498", fontFamily: "monospace" }}>
-                      ⏱ retrieval {answer._timings.retrieval_ms ?? "—"}ms · gemini {answer._timings.gemini_ms ?? "—"}ms · total {answer._timings.total_ms ?? "—"}ms
-                      {answer.cached && " · ✓ cached"}
+                    <div style={{ marginTop: "10px", paddingTop: "8px", borderTop: "1px solid rgba(255,255,255,0.08)", fontSize: "11px", color: "#8b9bb4", fontFamily: "monospace", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                      <span>⏱ Retrieval: <b style={{ color: "#c1cddb" }}>{Number(answer._timings.retrieval_ms ?? 0)}ms</b></span>
+                      <span>·</span>
+                      <span>Gemini API: <b style={{ color: "#c1cddb" }}>{Number(answer._timings.gemini_ms ?? 0).toLocaleString()}ms</b></span>
+                      <span>·</span>
+                      <span>Total: <b style={{ color: "#c1cddb" }}>{Number(answer._timings.total_ms ?? 0).toLocaleString()}ms</b></span>
+                      {answer.cached && <span style={{ color: "#67e0a3", fontWeight: 600 }}>· ✓ Cached</span>}
                     </div>
                   )}
                 </div>

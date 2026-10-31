@@ -21,6 +21,18 @@ import {
   PRIORITY_LEVELS,
   seedVerifiedAnnouncements
 } from "./pushEngine.js";
+import {
+  seedPrimaryFinancialData,
+  getFinancialEvidenceForAi
+} from "./financialDataIngestion.js";
+
+// Initialize SQLite data stores idempotently on boot
+try {
+  seedVerifiedAnnouncements();
+  seedPrimaryFinancialData(db);
+} catch (err) {
+  console.warn("[Startup] Notice during data seeding:", err.message);
+}
 
 const app = express();
 app.use(helmet());
@@ -969,10 +981,24 @@ app.get("/api/research/:symbol", async (req, res, next) => {
     };
 
     const researchPack = getResearchPack(symbol, baseData.company?.name);
+    const financialEvidence = getFinancialEvidenceForAi(db, symbol);
+
+    // Merge database-indexed documents if available, falling back to research pack
+    const activeDocuments = financialEvidence.raw.documents.length > 0
+      ? financialEvidence.raw.documents.map(d => ({
+          doc_id: d.id,
+          title: d.title,
+          doc_type: d.doc_type,
+          period: d.period || "Current",
+          doc_date: d.doc_date,
+          num_pages: d.num_pages || 24,
+          source_url: d.source_url
+        }))
+      : researchPack.documents.data.documents;
 
     res.json({
       symbol,
-      provider: "TejHQ",
+      provider: "TejHQ + Primary Exchange Filings (NSE/BSE)",
       profile: {
         data: {
           company: {
@@ -983,9 +1009,12 @@ app.get("/api/research/:symbol", async (req, res, next) => {
           quote
         }
       },
-      documents: researchPack.documents,
+      documents: { data: { documents: activeDocuments } },
       earningsCalls: researchPack.earningsCalls,
       digest: researchPack.digest,
+      financialStatements: { data: financialEvidence.raw.financials },
+      managementGuidance: { data: financialEvidence.raw.guidance },
+      dataAvailability: financialEvidence.dataAvailability,
       corporateActions: {
         data: Array.isArray(actions.data)
           ? actions.data.map(a => normalizeAction(a, symbol))
@@ -997,7 +1026,7 @@ app.get("/api/research/:symbol", async (req, res, next) => {
         source: "TejHQ"
       },
       retrievedAt: new Date().toISOString(),
-      note: "Research data sourced from TejHQ EOD price and corporate-actions data. Company fundamentals, filings, and earnings-call analysis are not available through TejHQ. Use primary exchange sources (NSE/BSE) and company investor-relations pages for filing documents."
+      note: "Primary financial statements, guidance extractions and official documents are sourced directly from NSE/BSE filings and company IR. End-of-day quotes and corporate actions are provided by TejHQ."
     });
   } catch (e) { next(e); }
 });
@@ -1045,7 +1074,14 @@ app.post("/api/ask", async (req, res, next) => {
     // ── Phase 1+2: Parallel data retrieval ──────────────────────────────────
     const tRetrievalStart = Date.now();
     let research = {};
+    let financialEvidence = { dataAvailability: {}, raw: { financials: [], guidance: [], documents: [] }, formattedPromptContext: {} };
+    let companyInfo = { company: { name: symbol }, fundamentals: {} };
+
     try {
+      // Retrieve SQLite-ingested primary financials, guidance and documents
+      financialEvidence = getFinancialEvidenceForAi(db, symbol);
+      companyInfo = getCompanyFundamentals(symbol);
+
       // Reduced window: 14 days is enough for recent-trend questions (was 90 days)
       const ohlcvFromDate = (() => {
         const d = new Date();
@@ -1065,23 +1101,32 @@ app.post("/api/ask", async (req, res, next) => {
         })
       ]);
       research = {
-        provider: "TejHQ",
+        provider: "TejHQ + Exchange Filings (NSE/BSE)",
         recentOhlcv: Array.isArray(ohlcv.data) ? ohlcv.data.slice(-30) : [],
-        corporateActions: Array.isArray(actions.data) ? actions.data : [],
-        dataLimitation: "TejHQ provides EOD price and corporate-actions data only. Company financials, filing documents, and earnings-call transcripts are not available."
+        corporateActions: Array.isArray(actions.data) ? actions.data : []
       };
     } catch (e) {
       research = { retrievalError: e.message };
     }
     const tRetrievalMs = Date.now() - tRetrievalStart;
-    console.log(`[AI Research] [${symbol}] Retrieval: ${tRetrievalMs} ms  (OHLCV rows: ${research.recentOhlcv?.length ?? 0}, actions: ${research.corporateActions?.length ?? 0})`);
+    console.log(`[AI Research] [${symbol}] Retrieval: ${tRetrievalMs} ms (Financials: ${financialEvidence.dataAvailability.financialCount || 0}, Guidance: ${financialEvidence.dataAvailability.guidanceCount || 0}, Docs: ${financialEvidence.dataAvailability.documentCount || 0})`);
+
+    const evidenceSourcesPayload = {
+      provider: "TejHQ + Exchange Filings (NSE/BSE)",
+      dataAvailability: financialEvidence.dataAvailability,
+      financials: financialEvidence.raw.financials,
+      guidance: financialEvidence.raw.guidance,
+      documents: financialEvidence.raw.documents,
+      recentOhlcv: research.recentOhlcv || [],
+      corporateActions: research.corporateActions || []
+    };
 
     const apiKey = (process.env.GEMINI_API_KEY || process.env.LLM_API_KEY || "").trim();
     if (!apiKey) {
       return res.json({
         symbol,
-        answer: "AI is not configured. Add a Gemini API key (GEMINI_API_KEY or LLM_API_KEY) in environment variables. Retrieved TejHQ price and corporate-actions data is shown below; no AI analysis has been fabricated.",
-        sources: research,
+        answer: "AI is not configured. Add a Gemini API key (GEMINI_API_KEY or LLM_API_KEY) in environment variables. Retrieved primary financial results, management guidance, and TejHQ market data are available below.",
+        sources: evidenceSourcesPayload,
         aiConfigured: false
       });
     }
@@ -1096,7 +1141,6 @@ app.post("/api/ask", async (req, res, next) => {
     const fallbackModel   = configuredModel === "gemini-3.1-flash-lite" ? "gemini-3.6-flash" : "gemini-3.1-flash-lite";
 
     // ── Phase 3: Build compact prompt ────────────────────────────────────────
-    // Keep only the last 7 OHLCV rows (sufficient for recent-trend answers)
     const recentCloses = Array.isArray(research.recentOhlcv) && research.recentOhlcv.length > 0
       ? research.recentOhlcv.slice(-7).map(d => ({ date: d.date, close: d.close, volume: d.volume }))
       : [];
@@ -1112,25 +1156,38 @@ app.post("/api/ask", async (req, res, next) => {
         : []
     };
 
-    // Concise system prompt — stripped of redundant repetition (saves ~300 tokens)
     const systemPrompt =
-      "You are FINN, a factual investment research assistant. " +
-      "Rely strictly on the retrieved TejHQ EOD price and corporate-actions data provided in the user message. " +
-      "TejHQ data does NOT include P/E, EPS, revenue, margins, filing documents, or earnings transcripts — state clearly if such data is unavailable. " +
-      "Be concise, cite dates and figures from the data, separate facts from interpretation, and never fabricate. " +
-      "This is informational only — not investment advice.";
+      "You are FINN, an institutional investment research assistant specializing in Indian public equities. " +
+      "Use ONLY the company-related source material in the retrieved data and user-provided context. " +
+      "The retrieved data includes official exchange-filed financial results (NSE/BSE), management guidance extracted from earnings conference calls, and primary source filing links. " +
+      "\n\nCRITICAL GROUNDING RULES:\n" +
+      "1. DISTINGUISH ACTUALS FROM GUIDANCE: Clearly separate reported historical/current financial results from management's forward-looking guidance. " +
+      "2. COMPARE GUIDANCE VS DELIVERED RESULTS: Whenever addressing performance, guidance, or targets, explicitly compare what management guided with what was actually delivered in the financial statements. Cite both absolute reported numbers (e.g. ₹ in Cr) and percentage growth/margins. Highlight if the company met, beat, or missed targets. " +
+      "3. SPECIFY PERIODS & DATES: Always state the exact reporting period (e.g. Q2 FY27, FY26) and filing/call dates for every metric. " +
+      "4. PROVIDE CLICKABLE SOURCE LINKS: Include markdown links to the primary filings and transcripts provided in the evidence (e.g. [NSE Results Filing](url), [Earnings Call Transcript](url)). " +
+      "5. ACCURACY & MISSING DATA: Never fabricate or estimate financial figures. If any specific metric, guidance target, or document is unavailable in the retrieved evidence, state clearly that it is unavailable in the indexed filings. " +
+      "6. DISCLAIMER: Informational research synthesis only — not investment advice.";
+
+    const promptUserPayload = {
+      symbol,
+      company: companyInfo.company?.name || symbol,
+      question,
+      evidence: {
+        reportedActuals: financialEvidence.formattedPromptContext?.reportedActualsTable || "No reported financial statements found.",
+        managementGuidance: financialEvidence.formattedPromptContext?.managementGuidanceNotes || "No formal guidance targets found.",
+        precomputedComparisons: financialEvidence.formattedPromptContext?.precomputedComparisons || [],
+        primarySourceDocuments: financialEvidence.formattedPromptContext?.primarySourceLinks || "No official document links found.",
+        keyRatios: companyInfo.fundamentals || {},
+        marketData: compactResearch
+      },
+      ...(context.trim() ? { additionalUserContext: context } : {})
+    };
 
     const messages = [
       { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: JSON.stringify({
-          symbol,
-          question,
-          marketData: compactResearch,
-          // Only pass frontend context if non-empty and genuinely relevant
-          ...(context.trim() ? { additionalContext: context } : {})
-        })
+        content: JSON.stringify(promptUserPayload)
       }
     ];
 
@@ -1138,8 +1195,8 @@ app.post("/api/ask", async (req, res, next) => {
     console.log(`[AI Research] [${symbol}] Prompt size: ${promptBytes} bytes  model: ${configuredModel}`);
 
     const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
-    // max_tokens=600: enough for a focused research answer; prevents runaway generation latency
-    const MAX_TOKENS = Number(process.env.LLM_MAX_TOKENS || 600);
+    // max_tokens=1000: ample space for thorough guidance vs actual comparison tables and markdown source links
+    const MAX_TOKENS = Number(process.env.LLM_MAX_TOKENS || 1000);
 
     // ── Phase 4: Gemini API call ─────────────────────────────────────────────
     const tGeminiStart = Date.now();
@@ -1221,9 +1278,19 @@ app.post("/api/ask", async (req, res, next) => {
         console.log(`[AI Research] [${symbol}] Gemini stream: ${tGeminiMs} ms  reply: ${fullText.length} chars  total: ${Date.now() - tTotal} ms`);
 
         // Cache the full streamed reply
-        if (fullText) askCache.set(cacheKey, { at: Date.now(), answer: fullText, sources: research });
+        if (fullText) askCache.set(cacheKey, { at: Date.now(), answer: fullText, sources: evidenceSourcesPayload });
 
-        res.write(`data: ${JSON.stringify({ done: true, sources: research, symbol, aiConfigured: true, timings: { retrieval: tRetrievalMs, gemini: tGeminiMs } })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          done: true,
+          sources: evidenceSourcesPayload,
+          symbol,
+          aiConfigured: true,
+          timings: {
+            retrieval_ms: tRetrievalMs,
+            gemini_ms: tGeminiMs,
+            total_ms: Date.now() - tTotal
+          }
+        })}\n\n`);
         return res.end();
 
       } catch (err) {
@@ -1280,10 +1347,19 @@ app.post("/api/ask", async (req, res, next) => {
     console.log(`[AI Research] [${symbol}] Gemini: ${tGeminiMs} ms  reply: ${reply.length} chars  total: ${tTotalMs} ms  (retrieval: ${tRetrievalMs} ms, prompt: ${promptBytes} bytes)`);
 
     // Store in cache
-    askCache.set(cacheKey, { at: Date.now(), answer: reply, sources: research });
+    askCache.set(cacheKey, { at: Date.now(), answer: reply, sources: evidenceSourcesPayload });
 
-    res.json({ symbol, answer: reply, sources: research, aiConfigured: true,
-      _timings: { retrieval_ms: tRetrievalMs, gemini_ms: tGeminiMs, total_ms: tTotalMs } });
+    res.json({
+      symbol,
+      answer: reply,
+      sources: evidenceSourcesPayload,
+      aiConfigured: true,
+      _timings: {
+        retrieval_ms: tRetrievalMs,
+        gemini_ms: tGeminiMs,
+        total_ms: tTotalMs
+      }
+    });
   } catch (e) { next(e); }
 });
 

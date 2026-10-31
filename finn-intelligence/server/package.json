@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --watch-path=index.js --watch-path=companyDirectory.js --watch-path=pushEngine.js --watch-path=auth.js --watch-path=db.js index.js",
     "start": "node index.js",
-    "test": "node --test portfolio.test.js pushEngine.test.js askFinn.test.js"
+    "test": "node --test portfolio.test.js pushEngine.test.js askFinn.test.js researchAi.test.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

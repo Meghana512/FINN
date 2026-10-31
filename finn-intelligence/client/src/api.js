@@ -141,12 +141,17 @@ export async function askFinnStream({ symbol, question, context = "" }, onDelta,
             onDelta(parsed.delta);
           }
           if (parsed.done) {
+            const rawTimings = parsed.timings || parsed._timings;
             finalResult = {
               answer: fullText,
-              symbol:      parsed.symbol ?? symbol,
-              sources:     parsed.sources ?? null,
+              symbol:       parsed.symbol ?? symbol,
+              sources:      parsed.sources ?? null,
               aiConfigured: parsed.aiConfigured ?? true,
-              _timings:    parsed.timings ?? null
+              _timings: rawTimings ? {
+                retrieval_ms: rawTimings.retrieval_ms ?? rawTimings.retrieval ?? 0,
+                gemini_ms:    rawTimings.gemini_ms ?? rawTimings.gemini ?? 0,
+                total_ms:     rawTimings.total_ms ?? rawTimings.total ?? 0
+              } : null
             };
           }
         } catch (parseErr) {
