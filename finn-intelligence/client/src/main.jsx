@@ -397,6 +397,7 @@ function App() {
   const [question,setQuestion] = useState("Compare management's guidance with actual financial performance. What is supported by the primary sources?");
   const [answer,setAnswer] = useState(null);
   const [asking,setAsking] = useState(false);
+  const [chatHistory,setChatHistory] = useState([]);
   const [filter,setFilter] = useState("All");
   const [windowHours,setWindowHours] = useState("24");
   const [priceThreshold,setPriceThreshold] = useState(3);
@@ -453,7 +454,7 @@ function App() {
   const openResearch=async(sym=symbol)=>{
     const s=String(sym).trim().toUpperCase().replace(/\.NS$|\.BO$/,"");
     if(!/^[A-Z0-9&._-]{1,24}$/.test(s)){setError("Enter a valid NSE/BSE ticker.");return;}
-    setSymbol(s); setPage("Research"); setResearchLoading(true); setResearch(null); setAnswer(null); setError("");
+    setSymbol(s); setPage("Research"); setResearchLoading(true); setResearch(null); setAnswer(null); setChatHistory([]); setError("");
     try{setResearch(await api(`/api/research/${encodeURIComponent(s)}`));}
     catch(e){setError(e.message);}
     finally{setResearchLoading(false);}
@@ -469,12 +470,18 @@ function App() {
       digest: research.digest
     }).slice(0, 1000) : "";
 
+    // Convert prior completed Q&A turns to history array for Gemini multi-turn context
+    const historyPayload = chatHistory.flatMap(turn => [
+      { role: "user", content: turn.question },
+      { role: "assistant", content: turn.answer }
+    ]);
+
     // Accumulate streamed text
     let accumulated = "";
 
     try {
       await askFinnStream(
-        { symbol, question: promptToUse, context },
+        { symbol, question: promptToUse, context, history: historyPayload },
         // onDelta: show progressive output token-by-token
         (delta) => {
           accumulated += delta;
@@ -491,6 +498,18 @@ function App() {
             ...finalResult,
             isStreaming: false
           });
+          if (finalResult.answer && !finalResult.isError) {
+            setChatHistory(prev => [
+              ...prev,
+              {
+                question: promptToUse,
+                answer: finalResult.answer,
+                sources: finalResult.sources,
+                _timings: finalResult._timings
+              }
+            ]);
+            setQuestion("");
+          }
         }
       );
     } catch (e) {
@@ -604,16 +623,55 @@ function App() {
               ):<Empty title="Search a company to begin" text="FINN retrieves available company profile, parsed documents and earnings-call summaries."/>}
             </section>
             <section className="panel ask-panel">
-              <div className="ask-panel-head"><div className="ask-card-icon"><Sparkles size={19}/></div><div><h3>Ask FINN</h3><p>Source-grounded research synthesis.</p></div></div>
+              <div className="ask-panel-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                  <div className="ask-card-icon"><Sparkles size={19}/></div>
+                  <div><h3>Ask FINN</h3><p>Source-grounded research synthesis.</p></div>
+                </div>
+                {chatHistory.length > 0 && (
+                  <button
+                    className="secondary-btn"
+                    style={{ fontSize: "11px", padding: "4px 8px", cursor: "pointer" }}
+                    onClick={() => { setChatHistory([]); setAnswer(null); setQuestion(""); }}
+                    title="Start a new research topic for this stock"
+                  >
+                    New Topic
+                  </button>
+                )}
+              </div>
+              {chatHistory.length > 0 && (
+                <div style={{ margin: "10px 0 12px", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "6px", padding: "8px 10px", background: "rgba(0,0,0,0.2)" }}>
+                  <div style={{ fontSize: "11px", color: "#8b9bb4", fontWeight: 600, marginBottom: "6px" }}>
+                    RESEARCH CONVERSATION ({chatHistory.length} {chatHistory.length === 1 ? "turn" : "turns"})
+                  </div>
+                  <div style={{ maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {chatHistory.map((turn, i) => (
+                      <div key={i} style={{ fontSize: "11px", borderLeft: "2px solid #3b82f6", paddingLeft: "8px" }}>
+                        <div style={{ color: "#60a5fa", fontWeight: 600 }}>Q{i+1}: {turn.question}</div>
+                        <div style={{ color: "#94a3b8", fontSize: "10.5px", marginTop: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          A: {turn.answer.replace(/[#*`]/g, "").slice(0, 110)}...
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               <label className="field-label">RESEARCH ANGLE QUICK SELECT</label>
               <div className="quick-symbols" style={{ flexWrap: "wrap", marginBottom: "12px" }}>
                 {researchPrompts.slice(0, 4).map(p=>(
                   <button key={p.label} onClick={()=>{ setQuestion(p.prompt); }}>{p.label}</button>
                 ))}
               </div>
-              <label className="field-label">YOUR RESEARCH QUESTION</label>
-              <textarea value={question} onChange={e=>setQuestion(e.target.value)} rows="5" placeholder="Compare guidance with reported results. Cite primary sources."/>
-              <button className="primary-btn full" onClick={()=>askFinn(question)} disabled={asking||!question.trim()}>{asking?<LoaderCircle size={16} className="spin"/>:<Sparkles size={16}/>} {asking ? "Synthesizing research..." : "Analyse with sources"}</button>
+              <label className="field-label">{chatHistory.length > 0 ? "ASK A FOLLOW-UP QUESTION" : "YOUR RESEARCH QUESTION"}</label>
+              <textarea
+                value={question}
+                onChange={e=>setQuestion(e.target.value)}
+                rows={chatHistory.length > 0 ? 3 : 5}
+                placeholder={chatHistory.length > 0 ? "Ask a follow-up (e.g. 'Compare operating margin with previous quarter' or 'What did management say about growth?')..." : "Compare guidance with reported results. Cite primary sources."}
+              />
+              <button className="primary-btn full" onClick={()=>askFinn(question)} disabled={asking||!question.trim()}>
+                {asking ? <LoaderCircle size={16} className="spin"/> : <Sparkles size={16}/>} {asking ? "Synthesizing research..." : (chatHistory.length > 0 ? "Ask follow-up with context" : "Analyse with sources")}
+              </button>
               {asking && !answer?.answer && (
                 <div className="answer-block" style={{ borderStyle: "dashed", borderColor: "#2a523d", background: "#0e1814" }}>
                   <div className="answer-label" style={{ color: "#67e0a3" }}>

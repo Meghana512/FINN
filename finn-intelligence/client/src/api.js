@@ -87,7 +87,7 @@ export async function api(path, options = {}) {
  * @param {(result: object) => void} onDone  - called once with the complete result
  * @param {AbortSignal} [signal] - optional external abort signal
  */
-export async function askFinnStream({ symbol, question, context = "" }, onDelta, onDone, signal) {
+export async function askFinnStream({ symbol, question, context = "", history = [] }, onDelta, onDone, signal) {
   const token = localStorage.getItem("finn_token");
   const url   = `${API}/api/ask`;
 
@@ -103,7 +103,12 @@ export async function askFinnStream({ symbol, question, context = "" }, onDelta,
         Accept: "text/event-stream",
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
-      body: JSON.stringify({ symbol, question, context: context.slice(0, 1000) }),
+      body: JSON.stringify({
+        symbol,
+        question,
+        context: context.slice(0, 1000),
+        history: Array.isArray(history) ? history.slice(-6) : []
+      }),
       signal: controller.signal
     });
 

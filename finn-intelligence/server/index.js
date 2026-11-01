@@ -1063,8 +1063,19 @@ app.post("/api/ask", async (req, res, next) => {
 
     if (!question) return res.status(400).json({ error: "Enter a research question." });
 
+    // ── Multi-turn conversation history support ──────────────────────────────
+    const rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
+    const cleanHistory = rawHistory
+      .filter(h => h && (h.role === "user" || h.role === "assistant") && typeof h.content === "string" && h.content.trim())
+      .slice(-6)
+      .map(h => ({
+        role: h.role === "assistant" ? "assistant" : "user",
+        content: String(h.content).trim().slice(0, 1500)
+      }));
+
     // ── Cache hit ────────────────────────────────────────────────────────────
-    const cacheKey = `${symbol}::${question}`;
+    const historyHash = cleanHistory.length > 0 ? `::h${cleanHistory.length}:${cleanHistory[cleanHistory.length - 1].content.slice(0, 40)}` : "";
+    const cacheKey = `${symbol}::${question}${historyHash}`;
     const cached = askCache.get(cacheKey);
     if (cached && (Date.now() - cached.at) < ASK_CACHE_TTL_MS) {
       console.log(`[AI Research] Cache hit for ${symbol} — 0 ms`);
@@ -1137,8 +1148,13 @@ app.post("/api/ask", async (req, res, next) => {
       "https://generativelanguage.googleapis.com/v1beta/openai"
     ).trim().replace(/\/+$/, "");
 
-    const configuredModel = (process.env.GEMINI_MODEL || process.env.LLM_MODEL || "gemini-3.8-flash").trim();
-    const fallbackModel   = configuredModel === "gemini-3.1-flash-lite" ? "gemini-3.6-flash" : "gemini-3.1-flash-lite";
+    const configuredModel = (process.env.GEMINI_MODEL || process.env.LLM_MODEL || "gemini-flash-lite-latest").trim();
+    // Prioritized, deduplicated candidate models for high availability and quota resilience
+    const candidateModels = Array.from(new Set([
+      configuredModel,
+      "gemini-flash-lite-latest",
+      "gemini-3.6-flash"
+    ].filter(Boolean)));
 
     // ── Phase 3: Build compact prompt ────────────────────────────────────────
     const recentCloses = Array.isArray(research.recentOhlcv) && research.recentOhlcv.length > 0
@@ -1185,6 +1201,7 @@ app.post("/api/ask", async (req, res, next) => {
 
     const messages = [
       { role: "system", content: systemPrompt },
+      ...cleanHistory,
       {
         role: "user",
         content: JSON.stringify(promptUserPayload)
@@ -1192,7 +1209,7 @@ app.post("/api/ask", async (req, res, next) => {
     ];
 
     const promptBytes = JSON.stringify(messages).length;
-    console.log(`[AI Research] [${symbol}] Prompt size: ${promptBytes} bytes  model: ${configuredModel}`);
+    console.log(`[AI Research] [${symbol}] Prompt size: ${promptBytes} bytes  models: ${candidateModels.join(" -> ")}`);
 
     const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 120000);
     // max_tokens=1000: ample space for thorough guidance vs actual comparison tables and markdown source links
@@ -1201,7 +1218,6 @@ app.post("/api/ask", async (req, res, next) => {
     // ── Phase 4: Gemini API call ─────────────────────────────────────────────
     const tGeminiStart = Date.now();
     let reply = null;
-    let primaryStatus = null;
 
     // Helper: single Gemini call (non-streaming)
     const callGemini = async (model, signal) => {
@@ -1229,117 +1245,133 @@ app.post("/api/ask", async (req, res, next) => {
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
 
-      try {
-        const streamRes = await fetch(`${base}/chat/completions`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: configuredModel,
-            temperature: 0.1,
-            max_tokens: MAX_TOKENS,
-            stream: true,
-            messages
-          }),
-          signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
-        });
+      let lastStreamErrMsg = "";
 
-        if (!streamRes.ok) {
-          const errBody = await streamRes.json().catch(() => ({}));
-          const errMsg = errBody?.error?.message || `Gemini returned HTTP ${streamRes.status}`;
-          res.write(`data: ${JSON.stringify({ error: errMsg, done: false })}\n\n`);
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-          return res.end();
-        }
+      for (const model of candidateModels) {
+        try {
+          console.log(`[AI Research] [${symbol}] Attempting streaming with candidate model: ${model}`);
+          const attemptTimeout = Math.min(LLM_TIMEOUT_MS, 45000);
+          const streamRes = await fetch(`${base}/chat/completions`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model,
+              temperature: 0.1,
+              max_tokens: MAX_TOKENS,
+              stream: true,
+              messages
+            }),
+            signal: AbortSignal.timeout(attemptTimeout)
+          });
 
-        let fullText = "";
-        const decoder = new TextDecoder();
-        for await (const chunk of streamRes.body) {
-          const text = decoder.decode(chunk, { stream: true });
-          for (const line of text.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === "data: [DONE]") continue;
-            if (trimmed.startsWith("data: ")) {
-              try {
-                const parsed = JSON.parse(trimmed.slice(6));
-                const delta = parsed.choices?.[0]?.delta?.content || "";
-                if (delta) {
-                  fullText += delta;
-                  res.write(`data: ${JSON.stringify({ delta, done: false })}\n\n`);
-                }
-              } catch (_) {}
+          if (!streamRes.ok) {
+            const errBody = await streamRes.json().catch(() => ({}));
+            const errMsg = errBody?.error?.message || `Gemini returned HTTP ${streamRes.status}`;
+            lastStreamErrMsg = errMsg;
+            console.warn(`[AI Research] [${symbol}] Model ${model} returned HTTP ${streamRes.status}: ${errMsg} — trying next model`);
+            continue;
+          }
+
+          let fullText = "";
+          let chunkReceived = false;
+          const decoder = new TextDecoder();
+          for await (const chunk of streamRes.body) {
+            const text = decoder.decode(chunk, { stream: true });
+            for (const line of text.split("\n")) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed === "data: [DONE]") continue;
+              if (trimmed.startsWith("data: ")) {
+                try {
+                  const parsed = JSON.parse(trimmed.slice(6));
+                  const delta = parsed.choices?.[0]?.delta?.content || "";
+                  if (delta) {
+                    chunkReceived = true;
+                    fullText += delta;
+                    res.write(`data: ${JSON.stringify({ delta, done: false })}\n\n`);
+                  }
+                } catch (_) {}
+              }
             }
           }
-        }
 
-        const tGeminiMs = Date.now() - tGeminiStart;
-        console.log(`[AI Research] [${symbol}] Gemini stream: ${tGeminiMs} ms  reply: ${fullText.length} chars  total: ${Date.now() - tTotal} ms`);
+          if (chunkReceived && fullText.trim()) {
+            const tGeminiMs = Date.now() - tGeminiStart;
+            console.log(`[AI Research] [${symbol}] Gemini stream (${model}): ${tGeminiMs} ms  reply: ${fullText.length} chars  total: ${Date.now() - tTotal} ms`);
 
-        // Cache the full streamed reply
-        if (fullText) askCache.set(cacheKey, { at: Date.now(), answer: fullText, sources: evidenceSourcesPayload });
+            // Cache the full streamed reply
+            askCache.set(cacheKey, { at: Date.now(), answer: fullText, sources: evidenceSourcesPayload });
 
-        res.write(`data: ${JSON.stringify({
-          done: true,
-          sources: evidenceSourcesPayload,
-          symbol,
-          aiConfigured: true,
-          timings: {
-            retrieval_ms: tRetrievalMs,
-            gemini_ms: tGeminiMs,
-            total_ms: Date.now() - tTotal
+            res.write(`data: ${JSON.stringify({
+              done: true,
+              sources: evidenceSourcesPayload,
+              symbol,
+              aiConfigured: true,
+              timings: {
+                retrieval_ms: tRetrievalMs,
+                gemini_ms: tGeminiMs,
+                total_ms: Date.now() - tTotal
+              }
+            })}\n\n`);
+            return res.end();
+          } else {
+            console.warn(`[AI Research] [${symbol}] Model ${model} delivered empty content stream — trying next model`);
           }
-        })}\n\n`);
-        return res.end();
-
-      } catch (err) {
-        if (err.name === "TimeoutError" || /timeout|aborted/i.test(err.message)) {
-          res.write(`data: ${JSON.stringify({ error: `Research timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s. Try a more targeted question.`, isTimeout: true, done: true })}\n\n`);
-          return res.end();
+        } catch (streamErr) {
+          lastStreamErrMsg = streamErr.message;
+          console.warn(`[AI Research] [${symbol}] Stream error with model ${model}: ${streamErr.name || "Error"} - ${streamErr.message}`);
         }
-        res.write(`data: ${JSON.stringify({ error: err.message, done: true })}\n\n`);
-        return res.end();
+      }
+
+      // If all candidate models failed
+      const isTimeout = /timeout|aborted/i.test(lastStreamErrMsg);
+      const finalErr = isTimeout
+        ? `Research timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s. Try a more targeted question.`
+        : (lastStreamErrMsg || "AI research service is temporarily unavailable. Please try again.");
+      res.write(`data: ${JSON.stringify({ error: finalErr, isTimeout, done: true })}\n\n`);
+      return res.end();
+    }
+
+    // ── Standard (non-streaming) path with candidate failover ────────────────
+    let lastNonStreamErr = null;
+
+    for (const model of candidateModels) {
+      try {
+        console.log(`[AI Research] [${symbol}] Attempting non-streaming with candidate model: ${model}`);
+        const attemptTimeout = Math.min(LLM_TIMEOUT_MS, 45000);
+        const response = await callGemini(model, AbortSignal.timeout(attemptTimeout));
+        const body = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
+          const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
+          console.warn(`[AI Research] [${symbol}] Candidate ${model} returned HTTP ${response.status}: ${errorMsg}`);
+          lastNonStreamErr = Object.assign(new Error(errorMsg), { status: response.status });
+          continue;
+        }
+
+        const candidateAnswer = body.choices?.[0]?.message?.content;
+        if (candidateAnswer && candidateAnswer.trim()) {
+          reply = candidateAnswer;
+          break;
+        }
+      } catch (err) {
+        console.warn(`[AI Research] [${symbol}] Non-stream error with ${model}: ${err.name || "Error"} - ${err.message}`);
+        lastNonStreamErr = err;
       }
     }
 
-    // ── Standard (non-streaming) path ────────────────────────────────────────
-    try {
-      const response = await callGemini(configuredModel, AbortSignal.timeout(LLM_TIMEOUT_MS));
-
-      primaryStatus = response.status;
-      const body = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        const errorDetail = Array.isArray(body) ? body[0]?.error : body?.error;
-        const errorMsg = errorDetail?.message || (typeof body === "string" ? body : `Gemini returned HTTP ${response.status}`);
-
-        // 503: try one fast fallback
-        if (response.status === 503) {
-          console.warn(`[AI Research] [${symbol}] ${configuredModel} 503 — trying fallback ${fallbackModel}`);
-          const fallbackRes = await callGemini(fallbackModel, AbortSignal.timeout(LLM_TIMEOUT_MS));
-          const fallbackBody = await fallbackRes.json().catch(() => ({}));
-          if (fallbackRes.ok) {
-            reply = fallbackBody.choices?.[0]?.message?.content || "The model returned no answer.";
-          } else {
-            const fbError = Array.isArray(fallbackBody) ? fallbackBody[0]?.error?.message : fallbackBody?.error?.message;
-            throw Object.assign(new Error(fbError || `Gemini returned HTTP ${fallbackRes.status}`), { status: fallbackRes.status });
-          }
-        } else {
-          throw Object.assign(new Error(errorMsg), { status: response.status });
-        }
-      } else {
-        reply = body.choices?.[0]?.message?.content || "The model returned no answer.";
-      }
-    } catch (err) {
-      if (err.name === "TimeoutError" || /timeout|aborted/i.test(err.message)) {
+    if (!reply) {
+      if (lastNonStreamErr && (lastNonStreamErr.name === "TimeoutError" || /timeout|aborted/i.test(lastNonStreamErr.message))) {
         console.warn(`[AI Research] [${symbol}] Gemini timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)}s`);
         return res.status(504).json({
           error: `Research synthesis timed out after ${Math.round(LLM_TIMEOUT_MS / 1000)} seconds. Google Gemini is taking longer than expected to analyze the data. Please try again with a more targeted question.`,
           isTimeout: true
         });
       }
-      throw err;
+      throw lastNonStreamErr || new Error("All Gemini models returned empty answers.");
     }
 
     const tGeminiMs = Date.now() - tGeminiStart;
